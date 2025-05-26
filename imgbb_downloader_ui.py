@@ -17,6 +17,7 @@ from bs4 import BeautifulSoup
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 import sys
+import pyperclip
 
 
 class ImgBBDownloaderUI:
@@ -374,17 +375,17 @@ class ImgBBDownloaderUI:
             if embed_button:
                 self.download_queue.put(("log", "点击嵌入代码按钮..."))
                 self.driver.execute_script("arguments[0].click();", embed_button)
-                time.sleep(2)
+                time.sleep(3)  # 等待页面加载
 
-                # 从页面源码提取viewer链接
-                page_source = self.driver.page_source
-                pattern = r'<a href="(https://ibb\.co/[^/"]+)"[^>]*>'
-                matches = re.findall(pattern, page_source)
+                # 方法1：尝试从textarea复制链接
+                viewer_links = self._extract_links_from_textarea()
 
-                # 去重
-                viewer_links = list(set(matches))
+                # 方法2：如果textarea方法失败，使用HTML解析作为备用
+                if not viewer_links:
+                    self.download_queue.put(("log", "textarea方法未获取到链接，尝试HTML解析方法..."))
+                    viewer_links = self._extract_links_from_html()
+
                 self.download_queue.put(("log", f"提取到 {len(viewer_links)} 个viewer链接"))
-
                 return viewer_links
             else:
                 self.download_queue.put(("error", "未找到嵌入代码按钮"))
@@ -392,6 +393,241 @@ class ImgBBDownloaderUI:
 
         except Exception as e:
             self.download_queue.put(("error", f"提取viewer链接失败: {str(e)}"))
+            return []
+
+    def _extract_links_from_textarea(self):
+        """从textarea中提取viewer链接"""
+        try:
+            self.download_queue.put(("log", "尝试从textarea获取链接..."))
+
+            # 查找包含viewer-links的textarea
+            textarea_selectors = [
+                'textarea[name="viewer-links"]',
+                'textarea[data-size="viewer"]',
+                'textarea[id*="album-embed-code"]',
+                'textarea[data-focus="select-all"]'
+            ]
+
+            textarea_element = None
+            for selector in textarea_selectors:
+                try:
+                    textarea_elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    if textarea_elements:
+                        textarea_element = textarea_elements[0]
+                        self.download_queue.put(("log", f"找到textarea元素: {selector}"))
+                        break
+                except:
+                    continue
+
+            if not textarea_element:
+                self.download_queue.put(("log", "未找到包含viewer-links的textarea"))
+
+                # 调试：显示所有textarea元素
+                all_textareas = self.driver.find_elements(By.TAG_NAME, "textarea")
+                self.download_queue.put(("log", f"页面中共有 {len(all_textareas)} 个textarea元素"))
+
+                for i, ta in enumerate(all_textareas):
+                    ta_name = ta.get_attribute('name') or ''
+                    ta_id = ta.get_attribute('id') or ''
+                    ta_class = ta.get_attribute('class') or ''
+                    self.download_queue.put(
+                        ("log", f"textarea {i + 1}: name='{ta_name}', id='{ta_id}', class='{ta_class}'"))
+
+                return []
+
+            # 方法1：直接获取textarea的内容
+            try:
+                self.download_queue.put(("log", "方法1: 直接获取textarea的value属性..."))
+
+                # 使用多种方式获取textarea内容
+                textarea_content = None
+
+                # 尝试1: 获取value属性
+                textarea_content = textarea_element.get_attribute('value')
+                if not textarea_content:
+                    # 尝试2: 获取textContent
+                    textarea_content = textarea_element.get_attribute('textContent')
+                if not textarea_content:
+                    # 尝试3: 获取innerHTML
+                    textarea_content = textarea_element.get_attribute('innerHTML')
+                if not textarea_content:
+                    # 尝试4: 使用JavaScript获取value
+                    textarea_content = self.driver.execute_script("return arguments[0].value;", textarea_element)
+                if not textarea_content:
+                    # 尝试5: 使用JavaScript获取textContent
+                    textarea_content = self.driver.execute_script("return arguments[0].textContent;", textarea_element)
+
+                if textarea_content:
+                    self.download_queue.put(("log", f"成功获取textarea内容，长度: {len(textarea_content)} 字符"))
+                    self.download_queue.put(("log", "=" * 50))
+                    self.download_queue.put(("log", "Textarea内容："))
+                    # 显示内容（限制长度）
+                    content_preview = textarea_content[:800] + "..." if len(
+                        textarea_content) > 800 else textarea_content
+                    self.download_queue.put(("log", content_preview))
+                    self.download_queue.put(("log", "=" * 50))
+
+                    # 解析链接
+                    viewer_links = self._parse_links_from_content(textarea_content)
+                    if viewer_links:
+                        return viewer_links
+                else:
+                    self.download_queue.put(("log", "textarea内容为空，尝试其他方法..."))
+
+            except Exception as e:
+                self.download_queue.put(("log", f"直接获取textarea内容失败: {e}"))
+
+            # 方法2：点击textarea并尝试复制
+            try:
+                self.download_queue.put(("log", "方法2: 点击textarea并复制..."))
+
+                # 滚动到textarea可见
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", textarea_element)
+                time.sleep(1)
+
+                # 点击textarea
+                self.driver.execute_script("arguments[0].click();", textarea_element)
+                time.sleep(0.5)
+
+                # 全选内容
+                # 方法A: 使用Ctrl+A
+                textarea_element.send_keys(Keys.CONTROL + "a")
+                time.sleep(0.5)
+
+                # 复制内容
+                textarea_element.send_keys(Keys.CONTROL + "c")
+                time.sleep(1)
+
+                # 获取剪贴板内容
+                try:
+                    clipboard_content = pyperclip.paste()
+                    if clipboard_content:
+                        self.download_queue.put(("log", f"从剪贴板获取到内容，长度: {len(clipboard_content)} 字符"))
+                        self.download_queue.put(("log", "剪贴板内容预览:"))
+                        content_preview = clipboard_content[:500] + "..." if len(
+                            clipboard_content) > 500 else clipboard_content
+                        self.download_queue.put(("log", content_preview))
+
+                        viewer_links = self._parse_links_from_content(clipboard_content)
+                        if viewer_links:
+                            return viewer_links
+                    else:
+                        self.download_queue.put(("log", "剪贴板内容为空"))
+                except Exception as e:
+                    self.download_queue.put(("log", f"获取剪贴板内容失败: {e}"))
+
+            except Exception as e:
+                self.download_queue.put(("log", f"点击复制方法失败: {e}"))
+
+            # 方法3：使用JavaScript强制获取内容
+            try:
+                self.download_queue.put(("log", "方法3: 使用JavaScript强制获取..."))
+
+                # 尝试多种JavaScript方法获取内容
+                js_methods = [
+                    "return arguments[0].value;",
+                    "return arguments[0].textContent;",
+                    "return arguments[0].innerText;",
+                    "return arguments[0].innerHTML;",
+                    "return arguments[0].defaultValue;",
+                    "arguments[0].select(); return document.getSelection().toString();",
+                ]
+
+                for i, js_code in enumerate(js_methods):
+                    try:
+                        content = self.driver.execute_script(js_code, textarea_element)
+                        if content and len(content.strip()) > 0:
+                            self.download_queue.put(("log", f"JavaScript方法 {i + 1} 成功获取内容"))
+                            viewer_links = self._parse_links_from_content(content)
+                            if viewer_links:
+                                return viewer_links
+                    except Exception as e:
+                        continue
+
+            except Exception as e:
+                self.download_queue.put(("log", f"JavaScript强制获取失败: {e}"))
+
+            self.download_queue.put(("log", "所有textarea获取方法都失败"))
+            return []
+
+        except Exception as e:
+            self.download_queue.put(("log", f"textarea方法整体失败: {e}"))
+            return []
+
+    def _parse_links_from_content(self, content):
+        """从内容中解析viewer链接"""
+        try:
+            viewer_links = []
+
+            if not content:
+                return []
+
+            # 按行分割内容
+            lines = content.split('\n')
+
+            for line in lines:
+                line = line.strip()
+                if line and 'ibb.co/' in line:
+                    # 方法1: 提取完整的https链接
+                    urls = re.findall(r'https://ibb\.co/[A-Za-z0-9]+', line)
+                    for url in urls:
+                        if '/album/' not in url:  # 排除相册链接
+                            viewer_links.append(url)
+
+                    # 方法2: 如果没有https，尝试提取ibb.co部分并补全
+                    if not urls and 'ibb.co/' in line:
+                        partial_urls = re.findall(r'ibb\.co/([A-Za-z0-9]+)', line)
+                        for partial_url in partial_urls:
+                            if len(partial_url) >= 5:  # 确保ID长度合理
+                                full_url = f'https://ibb.co/{partial_url}'
+                                viewer_links.append(full_url)
+
+            # 去重
+            viewer_links = list(set(viewer_links))
+
+            if viewer_links:
+                self.download_queue.put(("log", f"解析到 {len(viewer_links)} 个唯一viewer链接"))
+
+                # 显示前几个链接
+                for i, link in enumerate(viewer_links[:5]):
+                    self.download_queue.put(("log", f"  {i + 1}. {link}"))
+                if len(viewer_links) > 5:
+                    self.download_queue.put(("log", f"  ... 还有 {len(viewer_links) - 5} 个链接"))
+
+            return viewer_links
+
+        except Exception as e:
+            self.download_queue.put(("log", f"解析链接失败: {e}"))
+            return []
+
+    def _extract_links_from_html(self):
+        """从HTML源码提取viewer链接（备用方法）"""
+        try:
+            self.download_queue.put(("log", "使用HTML解析方法提取viewer链接..."))
+
+            # 获取页面源码
+            page_source = self.driver.page_source
+
+            # 使用正则表达式提取viewer链接
+            # 特征：<a href开头，含有https://ibb.co，且其后只有一个/
+            pattern = r'<a href="(https://ibb\.co/[^/"]+)"[^>]*>'
+            matches = re.findall(pattern, page_source)
+
+            # 去重
+            viewer_links = list(set(matches))
+
+            self.download_queue.put(("log", f"HTML方法提取到 {len(viewer_links)} 个viewer链接"))
+
+            # 显示前几个链接
+            for i, link in enumerate(viewer_links[:5]):
+                self.download_queue.put(("log", f"  {i + 1}. {link}"))
+            if len(viewer_links) > 5:
+                self.download_queue.put(("log", f"  ... 还有 {len(viewer_links) - 5} 个链接"))
+
+            return viewer_links
+
+        except Exception as e:
+            self.download_queue.put(("log", f"HTML解析方法失败: {e}"))
             return []
 
     def select_all_albums(self):
